@@ -1,16 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
-#
-# 整合说明：
-#   1) 在顶部加入 linkease nas / nas_luci feeds（带 grep 防重复守卫）
-#   2) 所有手工 UPDATE_PACKAGE 保持不变
-#   3) 末尾再补一次 feeds install -a -p nas_luci，作为保护：
-#      防止前面手工包（如 viking 里的 openlist2）的 find -iname
-#      把 feeds 里刚装好的同名包删掉
-#   4) 与现有 UPDATE_VERSION / 主题固化逻辑完全兼容
-
-set -e
 
 # 安装和更新软件包
 UPDATE_PACKAGE() {
@@ -40,13 +30,13 @@ UPDATE_PACKAGE() {
 
 	# 克隆 GitHub 仓库（支持分支和 tag 自动识别）
 	if git ls-remote --tags "https://github.com/$PKG_REPO.git" | grep -q "refs/tags/$PKG_BRANCH$"; then
-		# Tag 模式：先 clone 默认分支，再 fetch tag
+		# ✅ Tag 模式：先 clone 默认分支，再 fetch tag
 		echo "Tag mode detected: $PKG_BRANCH"
 		git clone --depth=1 "https://github.com/$PKG_REPO.git" "$REPO_NAME"
 		git -C "$REPO_NAME" fetch --depth=1 origin "refs/tags/$PKG_BRANCH:refs/tags/$PKG_BRANCH"
 		git -C "$REPO_NAME" checkout -q "refs/tags/$PKG_BRANCH"
 	else
-		# 分支模式：直接 clone 指定分支
+		# ✅ 分支模式：直接 clone 指定分支
 		echo "Branch mode: $PKG_BRANCH"
 		git clone --depth=1 --single-branch --branch "$PKG_BRANCH" "https://github.com/$PKG_REPO.git" "$REPO_NAME"
 	fi
@@ -59,17 +49,6 @@ UPDATE_PACKAGE() {
 		mv -f $REPO_NAME $PKG_NAME
 	fi
 }
-
-# ===================== NAS Feeds（先于手工包就位） =====================
-echo ">> Add linkease nas feeds"
-# 用 grep 守卫，避免 CI 重复执行时写入重复行
-grep -qF 'nas-packages.git' feeds.conf.default || {
-	echo 'src-git nas https://github.com/linkease/nas-packages.git;master' >> feeds.conf.default
-	echo 'src-git nas_luci https://github.com/linkease/nas-packages-luci.git;main' >> feeds.conf.default
-}
-./scripts/feeds update nas nas_luci
-./scripts/feeds install -a -p nas
-./scripts/feeds install -a -p nas_luci
 
 # ===================== 主题 =====================
 UPDATE_PACKAGE "argon" "sbwml/luci-theme-argon" "openwrt-25.12"
@@ -109,8 +88,8 @@ UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-bo
 UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
 # ===================== LED 控制器 (雅典娜 AX6600) =====================
-# 新仓库 JDC-AX6600-Athena-LED-Controller
-# 已移至 WRT-CORE.yml 手动安装（main 分支），此处注释避免重复克隆
+# ✅ 新仓库 JDC-AX6600-Athena-LED-Controller
+# ✅ 已移至 WRT-CORE.yml 手动安装（main 分支），此处注释避免重复克隆
 # UPDATE_PACKAGE "athena-led" "577090447/JDC-AX6600-Athena-LED-Controller" "main" "pkg"
 # UPDATE_PACKAGE "luci-app-athena-led" "577090447/JDC-AX6600-Athena-LED-Controller" "main" "pkg"
 
@@ -125,11 +104,10 @@ echo "========================================"
 echo "       EXTRA PACKAGES INSTALL DONE      "
 echo "========================================"
 
-# ===================== 保护：恢复可能被手工包误删的 nas_luci 包 =====================
-# 说明：上面 viking/openlist2 等手工包执行时，find -iname 会删掉 feeds 里同名目录，
-# 这里再装一次，把被误删的 nas_luci 包补回来（幂等，可重复执行）。
-echo ">> Protect nas_luci packages from being wiped by manual packages"
-./scripts/feeds install -a -p nas_luci
+# ===================== linkease（易有云） =====================
+# 本体 + LuCI 界面 + 中文翻译，一并处克隆进来
+UPDATE_PACKAGE "linkease" "linkease/nas-packages" "master" "" "linkease"
+UPDATE_PACKAGE "luci-app-linkease" "linkease/nas-packages-luci" "main" "" "luci-app-linkease luci-i18n-linkease-zh-cn"
 
 # ===================== 版本更新函数 =====================
 UPDATE_VERSION() {
@@ -193,22 +171,3 @@ exit 0
 EOF
 
 chmod +x files/etc/uci-defaults/*
-
-# ===================== 固定勾选的包（linkease 易有云） =====================
-# 放在全脚本最末尾：此时 feeds 与手工包均已就位，.config 才完整可信。
-# 依赖关系：luci-app-linkease（界面）依赖 linkease（后台本体），两者必须同时勾选；
-# luci-i18n-linkease-zh-cn 只是中文翻译，可选，此处一并勾上。
-# 用 sed 先删旧条目再写入，避免 .config 中已存在 "=n" / "# is not set" 导致 =y 被覆盖。
-if [ -f .config ]; then
-	echo ">> Lock linkease packages into .config"
-	for p in linkease luci-app-linkease luci-i18n-linkease-zh-cn; do
-		sed -i "/CONFIG_PACKAGE_$p=/d; /# CONFIG_PACKAGE_$p is not set/d" .config
-		echo "CONFIG_PACKAGE_$p=y" >> .config
-	done
-	# 展开依赖树：自动拉入 luci-lib-taskd / luci-app-store / libwebsockets 等
-	make defconfig
-	# 校验结果
-	grep -E "CONFIG_PACKAGE_(linkease|luci-app-linkease|luci-i18n-linkease-zh-cn)=" .config
-else
-	echo "!! .config not found, skip linkease pinning (run 'make menuconfig' or 'make defconfig' first)"
-fi
