@@ -154,15 +154,15 @@ if [ -f "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh" ]; then
 	source "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh"
 fi
 
-# ===================== 主题固化（✅ 已切换为 footstrap） =====================
+# ===================== 主题固化（✅ 已切换为 aurora） =====================
 sed -i '/luci.main.theme/d' package/emortal/default-settings/files/zzz-default-settings
 sed -i '/mediaurlbase/d' package/emortal/default-settings/files/zzz-default-settings
 
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-set-theme <<'EOF'
 #!/bin/sh
-uci set luci.main.theme="footstrap"
-uci set luci.main.mediaurlbase="/luci-static/footstrap"
+uci set luci.main.theme="aurora"
+uci set luci.main.mediaurlbase="/luci-static/aurora"
 uci commit luci
 rm -rf /tmp/luci-*
 /etc/init.d/uhttpd restart
