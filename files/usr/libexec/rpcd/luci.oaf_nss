@@ -1,0 +1,58 @@
+#!/bin/sh
+# /usr/libexec/rpcd/luci.oaf_nss
+# LuCI2 RPC：为 OAF/NSS 纯按钮视图提供状态与切换接口
+set -e
+
+_ecm_running()  { pidof nss-ecm >/dev/null 2>&1 || pidof qca-nss-ecm >/dev/null 2>&1; }
+_drv_loaded()  { [ -d /sys/module/qca_nss_drv ] || [ -d /sys/module/qca_nss_ecm ]; }
+_bypassed()    { [ "$(cat /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null)" = "1" ]; }
+_oaf_enabled() { /etc/init.d/appfilter enabled 2>/dev/null; }
+_oaf_running() { pidof appfilter >/dev/null 2>&1; }
+
+_read_state() {
+  local nss=0 oaf_en=0 oaf_run=0 bypass=0 fwd=0
+  if _drv_loaded && _ecm_running; then nss=1; fi
+  _oaf_enabled && oaf_en=1
+  _oaf_running  && oaf_run=1
+  _bypassed     && bypass=1
+  fwd=$(awk -F: '/^forwarded/ {gsub(/ /,"",$2); print $2+0; exit}' /proc/net/nss/stats 2>/dev/null)
+
+  printf '{"nss_running":%d,"oaf_enabled":%d,"oaf_running":%d,"ecm_bypassed":%d,"nss_forwarded":%d}' \
+         "$nss" "$oaf_en" "$oaf_run" "$bypass" "${fwd:-0}"
+}
+
+case "$1" in
+  list)
+    echo '{"state":{},"toggle":{}}'
+    ;;
+  call)
+    case "$2" in
+      state)  _read_state ;;
+      toggle)
+        # 目标态：true=开 OAF（即关 NSS），false=关 OAF（即开 NSS）
+        TARGET=$(cat | jsonfilter -e '@.enable' 2>/dev/null)
+        if [ "$TARGET" = "true" ]; then
+          # ---- 开 OAF：停 NSS ----
+          /etc/init.d/qca-nss-ecm stop 2>/dev/null
+          /etc/init.d/qca-nss-drv  stop 2>/dev/null
+          echo 1 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null
+          echo 1 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null
+          sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1
+          /etc/init.d/appfilter enable 2>/dev/null
+          /etc/init.d/appfilter start 2>/dev/null
+          logger -t oaf-nss "Luci 按钮：开启 OAF，NSS 已停止"
+        else
+          # ---- 关 OAF：恢复 NSS ----
+          /etc/init.d/appfilter stop  2>/dev/null
+          /etc/init.d/appfilter disable 2>/dev/null
+          echo 0 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null
+          echo 0 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null
+          /etc/init.d/qca-nss-drv  start 2>/dev/null
+          /etc/init.d/qca-nss-ecm start 2>/dev/null
+          logger -t oaf-nss "Luci 按钮：关闭 OAF，NSS 已恢复"
+        fi
+        _read_state
+        ;;
+    esac
+    ;;
+esac

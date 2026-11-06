@@ -1,0 +1,80 @@
+#!/bin/sh
+# /usr/sbin/nss-oaf —— NSS 与 OAF(appfilter) 手动切换
+#   nss-oaf stop    停 NSS/ECM（为 OAF 让出 nf_conn mark）
+#   nss-oaf start   恢复 NSS/ECM 满血加速
+#   nss-oaf status  查看状态
+#   nss-oaf guard   一次性巡检：OAF 启用时若 NSS 偷跑则强制停止
+set -e
+
+NSS_DRV=/etc/init.d/qca-nss-drv
+NSS_ECM=/etc/init.d/qca-nss-ecm
+APPF=/etc/init.d/appfilter
+TAG=oaf-nss
+
+_echo() { printf '%s\n' "$*"; }
+_log()  { logger -t "$TAG" "$*"; echo "$TAG: $*"; }
+
+nss_stop() {
+	_echo ">> 停止 NSS/ECM ..."
+	"$NSS_ECM" stop 2>/dev/null || true
+	"$NSS_DRV"  stop 2>/dev/null || true
+	echo 1 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null || true
+	echo 1 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null || true
+	sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true
+	_log "NSS/ECM 已停止"
+}
+
+nss_start() {
+	_echo ">> 启动 NSS/ECM ..."
+	echo 0 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null || true
+	echo 0 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null || true
+	"$NSS_DRV"  start 2>/dev/null || true
+	"$NSS_ECM" start 2>/dev/null || true
+	_log "NSS/ECM 已启动，请验证 /proc/net/nss/stats"
+}
+
+nss_status() {
+	_echo "--- appfilter 服务 ---"
+	if "$APPF" enabled 2>/dev/null; then _echo "enabled (开机自启)"; else _echo "disabled (不开机自启)"; fi
+	"$APPF" status 2>/dev/null || _echo "appfilter 未运行"
+
+	_echo "--- NSS/ECM init 状态 ---"
+	"$NSS_DRV"  status 2>/dev/null || _echo "qca-nss-drv: stopped"
+	"$NSS_ECM" status 2>/dev/null || _echo "qca-nss-ecm: stopped"
+
+	_echo "--- ECM 旁路开关 (1=旁路/已停) ---"
+	for f in /sys/kernel/debug/ecm/front_end_ipv4_stop \
+	         /sys/kernel/debug/ecm/front_end_ipv6_stop; do
+		[ -f "$f" ] && printf '%s = %s\n' "${f##*/}" "$(cat "$f")" || true
+	done
+
+	_echo "--- NSS 转发统计（forwarded 在涨即加速生效）---"
+	if [ -f /proc/net/nss/stats ]; then
+		head -5 /proc/net/nss/stats
+	else
+		_echo "(无 /proc/net/nss/stats，驱动未加载)"
+	fi
+}
+
+guard() {
+	# OAF 启用期间，任何东西偷偷拉起 NSS/ECM 都被强制打回
+	if "$APPF" enabled 2>/dev/null || pgrep -f "appfilter" >/dev/null 2>&1; then
+		if [ -d /sys/module/qca_nss_ecm ] || \
+		   [ -f /sys/kernel/debug/ecm/front_end_ipv4_stop ] && \
+		   [ "$(cat /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null)" != "1" ]; then
+			_log "guard: 检测到 NSS 在 OAF 启用期间自启，强制停止"
+			nss_stop
+		fi
+	fi
+}
+
+case "${1:-}" in
+	stop)   nss_stop   ;;
+	start)  nss_start  ;;
+	status) nss_status ;;
+	guard)  guard      ;;
+	*)
+		_echo "usage: nss-oaf {start|stop|status|guard}"
+		exit 1
+		;;
+esac

@@ -1,0 +1,10 @@
+{
+  "admin/services/oaf_nss": {
+    "title": "OAF / NSS 切换",
+    "order": 55,
+    "action": {
+      "type": "view",
+      "path": "system/oaf-nss-toggle"
+    }
+  }
+}

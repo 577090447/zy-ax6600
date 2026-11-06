@@ -1,0 +1,5 @@
+#!/bin/sh
+# /usr/sbin/oaf-nss-guard
+# cron 每分钟调用：OAF 处于启用状态时，拒绝 NSS/ECM 自启
+# 由 uci-defaults/92-oaf-nss-guard 安装并注册 crontab
+[ -x /usr/sbin/nss-oaf ] && /usr/sbin/nss-oaf guard
