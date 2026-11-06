@@ -1,0 +1,56 @@
+#!/bin/sh
+# /etc/uci-defaults/91-oaf-nss-autotoggle
+# 向 /etc/init.d/appfilter 注入 procd 钩子，实现双向自动联动：
+#   开 OAF (start) -> start_pre  自动停 NSS/ECM
+#   关 OAF (stop)  -> stop_post  自动恢复 NSS/ECM
+# 仅在首次启动（或 appfilter 尚不存在的编译期之后的首次 boot）执行，
+# 完成后自删。重复执行由 MARK 标记幂等保护。
+set -e
+
+INIT=/etc/init.d/appfilter
+SELF=/etc/uci-defaults/91-oaf-nss-autotoggle
+MARK="AUTO-ADDED:OAF-NSS-TOGGLE"
+
+# appfilter 尚未安装（例如 feeds 未选 luci-app-oaf）则静默跳过，不报错
+[ -x "$INIT" ] || { rm -f "$SELF"; exit 0; }
+
+# 幂等：已注入则不再重复追加
+if grep -q "$MARK" "$INIT" 2>/dev/null; then
+	rm -f "$SELF"; exit 0
+fi
+
+{
+	printf '\n# ===== %s (勿手改) =====\n' "$MARK"
+	printf '%s\n' 'start_pre() {'
+	printf '%s\n' '  logger -t oaf-nss "OAF 启动，停止 NSS/ECM ..."'
+	printf '%s\n' '  /etc/init.d/qca-nss-ecm stop 2>/dev/null'
+	printf '%s\n' '  /etc/init.d/qca-nss-drv stop 2>/dev/null'
+	printf '%s\n' '  echo 1 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null'
+	printf '%s\n' '  echo 1 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null'
+	printf '%s\n' '  sysctl -w net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1'
+	printf '%s\n' '}'
+	printf '%s\n' ''
+	printf '%s\n' 'stop_post() {'
+	printf '%s\n' '  logger -t oaf-nss "OAF 已停止，恢复 NSS/ECM ..."'
+	printf '%s\n' '  echo 0 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null'
+	printf '%s\n' '  echo 0 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null'
+	printf '%s\n' '  /etc/init.d/qca-nss-drv start 2>/dev/null'
+	printf '%s\n' '  /etc/init.d/qca-nss-ecm start 2>/dev/null'
+	printf '%s\n' '  logger -t oaf-nss "NSS 已恢复（验证: head /proc/net/nss/stats）"'
+	printf '%s\n' '}'
+	printf '%s\n' '# ===== END AUTO-ADDED ====='
+} >> "$INIT"
+
+chmod 755 "$INIT"
+
+# 首次启动自检：若 OAF 已启用，立即停 NSS（覆盖开机阶段）
+if "$INIT" enabled 2>/dev/null; then
+	/etc/init.d/qca-nss-ecm stop 2>/dev/null || true
+	/etc/init.d/qca-nss-drv  stop 2>/dev/null || true
+	echo 1 > /sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null || true
+	echo 1 > /sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null || true
+	logger -t oaf-nss "首次启动自检：OAF 已启用，NSS 已暂停"
+fi
+
+rm -f "$SELF"
+exit 0
