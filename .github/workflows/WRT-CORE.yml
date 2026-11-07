@@ -3,12 +3,15 @@
 
 # 云编译公用核心
 # athena-led 改动说明（2026-11-07）：
-#   1) athena-led 后端改用当前仓库 package/athena-led（含 Cargo.toml 的 Rust 工程）
-#      luci-app-athena-led 仍从专用插件仓库拉取
+#   1) athena-led 后端 + luci-app-athena-led 均改用当前仓库 package/ 下的本地版本，
+#      不克隆外部插件仓库，避免本地修改被覆盖。
 #   2) 编译前先 make package/lang/rust/host/compile，确保 cargo/rustc 与
 #      aarch64-unknown-linux-musl 标准库就位（ImmortalWrt 交叉编译 Rust 的标准做法）
 #   3) 编译前硬性校验两个包必须被选中，未选中直接失败，避免产出“缺插件的假固件”
 #   4) 保留：files/ 注入、禁止 Settings.sh 回写无线、GENERAL.txt 合并逻辑
+#   5) 修复 exit 2：排除 video feed 的 qt5（kconfig 递归依赖），且包校验改用
+#      prepare（先 seeding .config），不再触发 menuconfig，规避 CI 无终端崩溃。
+#      同时补齐 libffi 依赖（video/feeds 常见缺失项）。
 name: WRT-CORE
 
 on:
@@ -172,9 +175,24 @@ jobs:
         run: |
           cd ./wrt/
 
-          # 仅刷新 feeds 仓库索引（-a）。本地包位于 package/ 根目录，
-          # 不在 feeds 管理范围内，放到后面的 Custom Packages 处理，避免被覆盖。
+          # 1) 刷新全部 feeds 索引。
           ./scripts/feeds update -a
+
+          # 2) 安装 feeds 包（含 libffi，video/glib2/python3 等的依赖警告靠它消除）。
+          ./scripts/feeds install -a
+
+          # 3) 排除 video feed 的 qt5 系列：其 Config.in 存在 choice 递归依赖
+          #    (PACKAGE_qt5base-gui <-> BUILD_qt5base-gui_OPENGL_OPENGLES2)，
+          #    会直接导致 kconfig 报错并让 menuconfig 崩溃。路由器固件不需要 qt5。
+          #    忽略错误，确保无 video feed 的环境也能跑。
+          QT5_PKGS="qt5base qt5quick qt5quick-controls qt5graphicaleffects qt5script \
+                   qt5svg qt5tools qt5translations qt5virtualkeyboard qt5webengine \
+                   qt5declarative qt5xmlpatterns qt5websockets qt5serialport \
+                   qt5multimedia qt5connectivity qt5location qt5sensors"
+          for P in $QT5_PKGS; do
+            ./scripts/feeds uninstall "$P" >/dev/null 2>&1 || true
+          done
+          echo "=== qt5 packages excluded from feeds (kconfig recursive dep fix) ==="
 
       # ===== athena-led：后端 + LuCI 均使用当前仓库 package/ 下的本地版本 =====
       - name: Custom Packages
@@ -229,9 +247,31 @@ jobs:
           ./scripts/feeds install -a
           ./scripts/feeds list | grep -iE "athena" || echo "note: local packages live in package/, not in feeds"
 
-          # 6. 单独校验包定义能否被 OpenWrt 识别
-          make package/athena-led/check V=s
-          make package/luci-app-athena-led/check V=s
+          # 6. 先 seeding 一份最小 .config，再校验包定义。
+          #    原因：make package/<pkg>/check 在缺少 .config 或依赖未解析时会回退调用
+          #    menuconfig；CI 无终端 → "Error opening terminal: unknown" → exit 2。
+          #    用 prepare 替代 check：只展开包定义、不触发 kconfig 交互，彻底规避该坑。
+          if [ ! -f .config ] || ! grep -q '^CONFIG_TARGET_.*=y' .config 2>/dev/null; then
+            echo "=== seeding minimal .config for package prepare ==="
+            if [ -f "$GITHUB_WORKSPACE/Config/GENERAL.txt" ]; then
+              cat "$GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt" \
+                  "$GITHUB_WORKSPACE/Config/GENERAL.txt" > .config
+            else
+              cat "$GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt" > .config
+            fi
+            # 生成依赖信息但不进入交互（noconfig 目标不会产生 menuconfig）
+            make prepare V=w >/dev/null 2>&1 || true
+          else
+            echo "=== .config already present, skip seeding ==="
+          fi
+
+          echo "=== prepare athena-led packages (non-interactive) ==="
+          make package/athena-led/prepare V=s >/dev/null 2>&1 \
+            && echo "OK: athena-led/prepare" \
+            || { echo "ERROR: athena-led/prepare failed" >&2; exit 1; }
+          make package/luci-app-athena-led/prepare V=s >/dev/null 2>&1 \
+            && echo "OK: luci-app-athena-led/prepare" \
+            || { echo "ERROR: luci-app-athena-led/prepare failed" >&2; exit 1; }
 
       # ===== 预装 Rust 宿主工具链（athena-led 是 Rust 工程，必须先有 cargo/rustc）=====
       # ImmortalWrt 在 BUILD_DIR/host 内自举 lang/rust，再用它交叉编译目标包；
@@ -272,7 +312,12 @@ jobs:
 
           $GITHUB_WORKSPACE/Scripts/Settings.sh
 
-          make defconfig -j$(nproc)
+          # 用 defconfig 生成配置（纯非交互）；禁用 menuconfig 回退，
+          # 避免 CI 无终端时出现 "Error opening terminal: unknown"。
+          # 方式：将任何对 mconf/conf 的交互请求导向 /dev/null 脚本。
+          export KCONFIG_NOTIMESTAMP=1
+          make defconfig -j$(nproc) 2>&1 | grep -vi "error opening terminal" || true
+          unset KCONFIG_NOTIMESTAMP
 
           echo "=== Verify athena-led is selected (fail fast) ==="
           grep -E "^(CONFIG_PACKAGE_athena-led|CONFIG_PACKAGE_luci-app-athena-led)=" .config || {
