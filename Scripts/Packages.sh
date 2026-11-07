@@ -126,7 +126,7 @@ UPDATE_PACKAGE() {
 # 关键：PKG_NAME 用正式包名（luci-theme-xxx），与 .config 对齐
 UPDATE_PACKAGE "luci-theme-argon" "sbwml/luci-theme-argon" "openwrt-25.12"
 UPDATE_PACKAGE "luci-theme-aurora" "eamonxg/luci-theme-aurora" "master"
-# UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
+UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
 UPDATE_PACKAGE "luci-theme-fluent" "LazuliKao/luci-theme-fluent" "main"
 UPDATE_PACKAGE "luci-theme-footstrap" "VizzleTF/luci-theme-footstrap" "main"
 UPDATE_PACKAGE "luci-theme-kucat" "sirpdboy/luci-theme-kucat" "master"
@@ -181,6 +181,34 @@ UPDATE_PACKAGE "luci-app-mt5700" "LianXia233/luci-app-mt5700" "main"
 UPDATE_PACKAGE "luci-app-mt5700m" "LianXia233/luci-app-mt5700m" "main"
 UPDATE_PACKAGE "luci-app-netmonitor" "LianXia233/luci-app-netmonitor" "main"
 UPDATE_PACKAGE "luci-app-qmodem-generic" "LianXia233/luci-app-qmodem-generic" "main"
+
+# ========== 第三方扩展插件 ==========
+# 说明：
+#   - iStore / OAF 均为“一仓多包”，必须走 pkg 精准展开，仓库内子目录一并被扫描注册
+#   - iStore 强依赖 luci-lib-taskd（异步任务守护），缺它“安装”按钮无响应；
+#     CONFIG_USE_APK 下还需 luci-compat + apk，已在 Makefile 的 LUCI_DEPENDS 里声明
+#   - OAF 的 oaf 是内核模块(kmod-oaf)，必须与当前内核同编，不可事后 opkg 补装
+echo "========================================"
+echo "      EXTRA PACKAGES INSTALL START      "
+echo "========================================"
+
+# iStore：主包 + taskd 异步任务库 + 终端库
+UPDATE_PACKAGE "luci-app-store" "linkease/istore" "main" "pkg" "store luci-lib-taskd taskd luci-lib-xterm"
+
+# OAF 应用过滤：一仓三包 -> luci-app-oaf / oaf(kmod) / open-app-filter
+# 注：CONFIG_PACKAGE_luci-app-oaf=y 会自动带起另两个，oaf 必须与内核同编
+UPDATE_PACKAGE "luci-app-oaf" "destan19/OpenAppFilter" "master" "pkg" "oaf open-app-filter"
+
+echo "========================================"
+echo "       EXTRA PACKAGES INSTALL DONE      "
+echo "========================================"
+
+# ===================== linkease（易有云）=====================
+# 走 pkg 精准展开：主程序 + luci 前端 + 依赖库(luci-lib-linkeasefile 等) 一并注册
+# 注意：Makefile 实际在 network/services/linkease/ 与 luci/luci-app-linkease/，
+# 必须用 pkg 模式，单包模式会把 Makefile 埋到 4 级深度导致扫描不到
+UPDATE_PACKAGE "linkease" "linkease/nas-packages" "master" "pkg"
+UPDATE_PACKAGE "luci-app-linkease" "linkease/nas-packages-luci" "main" "pkg"
 
 # ===================== 版本更新函数 =====================
 # 说明：
