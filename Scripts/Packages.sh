@@ -102,7 +102,7 @@ UPDATE_PACKAGE() {
 # 关键修复：PKG_NAME 用正式包名 luci-theme-aurora，与 .config 对齐
 UPDATE_PACKAGE "luci-theme-aurora" "eamonxg/luci-theme-aurora" "master" "" "aurora"
 UPDATE_PACKAGE "luci-theme-argon" "sbwml/luci-theme-argon" "openwrt-25.12"
-# UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
+UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
 UPDATE_PACKAGE "luci-theme-fluent" "LazuliKao/luci-theme-fluent" "main"
 UPDATE_PACKAGE "luci-theme-footstrap" "VizzleTF/luci-theme-footstrap" "main"
 UPDATE_PACKAGE "luci-theme-kucat" "sirpdboy/luci-theme-kucat" "master"
@@ -226,6 +226,62 @@ UPDATE_VERSION() {
 
 # UPDATE_VERSION "软件包名" "测试版，true，可选，默认为否"
 # UPDATE_VERSION "sing-box"
+
+# ========== 第三方扩展插件 ==========
+# 说明：
+#   - 全部用“正式包名”作 PKG_NAME，保证目录名=包名，避免 package/install 阶段 no such package
+#   - iStore / OAF 均为“一仓多包”，走 pkg 精准展开，仓库子目录里的依赖包一并被扫描注册
+#   - oaf 是内核模块(kmod-oaf)，必须与当前内核版本严格匹配，务必进源码同编，不可事后补装
+echo "========================================"
+echo "      EXTRA PACKAGES INSTALL START      "
+echo "========================================"
+
+# iStore：正式包名 luci-app-store
+# 25.12 / apk 体系必须带 luci-compat + luci-lib-taskd，否则“安装”按钮无响应
+UPDATE_PACKAGE "luci-app-store" "linkease/istore" "main" "" "store istore"
+
+# OAF 应用过滤：一仓三包 -> luci-app-oaf / oaf(kmod) / open-app-filter
+UPDATE_PACKAGE "luci-app-oaf" "destan19/OpenAppFilter" "master" "pkg" "oaf open-app-filter luci-i18n-oaf-zh-cn"
+
+# Harbor File：LuCI 文件管理器
+UPDATE_PACKAGE "luci-app-harbor-file" "destan19/luci-app-harbor-file" "main" "" "luci-i18n-harbor-file-zh-cn"
+
+echo "========================================"
+echo "       EXTRA PACKAGES INSTALL DONE      "
+echo "========================================"
+
+# ===================== 主题固化（aurora，首次启动自动生效） =====================
+# 说明：
+#   - 同时清理两条可能的默认设置脚本路径，避免重复追加
+#   - 除 luci.main.theme / mediaurlbase 外，显式注册 luci.themes.aurora=1
+#     （25.12 / apk 体系下缺这一行，即使包装了，主题列表里也看不到 aurora）
+{
+	for _f in package/emortal/default-settings/files/zzz-default-settings \
+			  package/default-settings/files/zzz-default-settings; do
+		if [ -f "$_f" ]; then
+			sed -i '/luci.main.theme/d' "$_f"
+			sed -i '/mediaurlbase/d' "$_f"
+			sed -i '/luci.themes.aurora/d' "$_f"
+		fi
+	done
+
+	mkdir -p files/etc/uci-defaults
+	cat > files/etc/uci-defaults/99-set-theme <<'EOF'
+#!/bin/sh
+# 固化 aurora 主题，首次启动自动生效
+uci set luci.main.theme="aurora"
+uci set luci.main.mediaurlbase="/luci-static/aurora"
+uci set luci.themes.aurora=1
+uci commit luci
+rm -rf /tmp/luci-*
+if [ -x /etc/init.d/uhttpd ]; then
+	/etc/init.d/uhttpd restart
+fi
+exit 0
+EOF
+	chmod +x files/etc/uci-defaults/99-set-theme
+	echo "Theme pin script installed: files/etc/uci-defaults/99-set-theme"
+}
 
 # 引入私有扩展脚本
 if [ -f "${GITHUB_WORKSPACE:-}/Scripts/PRIVATE.sh" ]; then
