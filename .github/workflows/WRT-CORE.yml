@@ -1,4 +1,4 @@
-name: Build OpenWrt Core
+name: WRT-CORE
 
 on:
   workflow_dispatch:
