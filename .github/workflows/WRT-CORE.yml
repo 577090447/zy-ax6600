@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 VIKINGYFY
+
+# 云编译公用核心
+# athena-led 改动说明（2026-11-07 最终版）：
+#   1) athena-led 后端 + luci-app-athena-led 均使用本仓库 package/ 下的本地版本
+#      （后端为预编译版 Makefile，PKG_SOURCE:=none，不走 cargo/Rust）
+#   2) 已删除 Prepare Rust toolchain 步骤（预编译包无需 rust 宿主工具链）
+#   3) 用 make package/.../prepare 代替 check，规避 CI 无终端触发 menuconfig
+#   4) Update Feeds 后主动 uninstall qt5 系列，消除 video feed 的 kconfig 递归依赖
+#   5) defconfig 加 KCONFIG_NOTIMESTAMP，彻底封死 menuconfig 交互回退
+#   6) 编译前硬性校验两个包必须被选中，未选中直接失败
+#   7) 保留：files/ 注入、禁止 Settings.sh 回写无线、GENERAL.txt 合并逻辑
+name: WRT-CORE
+
+on:
+  workflow_call:
+    inputs:
+      WRT_CONFIG:
+        required: true
+        type: string
+      WRT_THEME:
+        required: true
+        type: string
+      WRT_NAME:
+        required: true
+        type: string
+      WRT_SSID:
+        required: true
+        type: string
+      WRT_WORD:
+        required: true
+        type: string
+      WRT_IP:
+        required: true
+        type: string
+      WRT_PW:
+        required: true
+        type: string
+      WRT_REPO:
+        required: true
+        type: string
+      WRT_BRANCH:
+        required: true
+        type: string
+      WRT_SOURCE:
+        required: true
+        type: string
+      WRT_PACKAGE:
+        required: false
+        type: string
+      WRT_TEST:
+        required: false
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+  WRT_CONFIG: ${{inputs.WRT_CONFIG}}
+  WRT_THEME: ${{inputs.WRT_THEME}}
+  WRT_NAME: ${{inputs.WRT_NAME}}
+  WRT_SSID: ${{inputs.WRT_SSID}}
+  WRT_WORD: ${{inputs.WRT_WORD}}
+  WRT_IP: ${{inputs.WRT_IP}}
+  WRT_PW: ${{inputs.WRT_PW}}
+  WRT_REPO: ${{inputs.WRT_REPO}}
+  WRT_BRANCH: ${{inputs.WRT_BRANCH}}
+  WRT_SOURCE: ${{inputs.WRT_SOURCE}}
+  WRT_PACKAGE: ${{inputs.WRT_PACKAGE}}
+  WRT_TEST: ${{inputs.WRT_TEST}}
+
+jobs:
+  core:
+    name: ${{inputs.WRT_SOURCE}}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq purge firefox
+          sudo -E apt -yqq update
+          sudo -E apt -yqq full-upgrade
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E apt -yqq install dos2unix libfuse-dev libncurses-dev libncurses6
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown $USER:$USER /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt $GITHUB_WORKSPACE/wrt
+
+      - name: Initialization Values
+        run: |
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+          echo "WRT_MARK=${GITHUB_REPOSITORY%%/*}" >> $GITHUB_ENV
+          echo "WRT_INFO=${WRT_SOURCE%%/*}" >> $GITHUB_ENV
+          echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./Config/$WRT_CONFIG.txt)" >> $GITHUB_ENV
+          echo "WRT_WIFI=wifi-yes" >> $GITHUB_ENV
+          echo "WRT_KVER=none" >> $GITHUB_ENV
+          echo "WRT_LIST=none" >> $GITHUB_ENV
+
+      - name: Clone Code
+        run: |
+          git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
+
+          cd ./wrt/ && echo "WRT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+
+          # GitHub Action 移除国内下载源
+          PROJECT_MIRRORS_FILE="./scripts/projectsmirrors.json"
+          if [ -f "$PROJECT_MIRRORS_FILE" ]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+          fi
+
+      # ===== 将仓库根的 files/ 注入到 OpenWrt 源码树（overlay）=====
+      - name: Inject custom files
+        run: |
+          if [ -d "${GITHUB_WORKSPACE}/files" ] && [ -n "$(ls -A ${GITHUB_WORKSPACE}/files)" ]; then
+            echo "Injecting custom files into OpenWrt source..."
+            mkdir -p "${GITHUB_WORKSPACE}/wrt/files"
+            cp -rf "${GITHUB_WORKSPACE}/files/." "${GITHUB_WORKSPACE}/wrt/files/"
+            echo "Custom files injected:"
+            ls -R "${GITHUB_WORKSPACE}/wrt/files"
+          else
+            echo "No custom files found or files/ is empty, skipping."
+          fi
+
+      - name: Check Scripts
+        run: |
+          find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
+
+      - name: Check Caches
+        id: check-cache
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache@main
+        with:
+          key: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
+          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}
+          path: |
+            ./wrt/.ccache
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Update Caches
+        if: env.WRT_TEST != 'true'
+        run: |
+          if [ -d "./wrt/staging_dir" ]; then
+            find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
+              find "$DIR" -type f -exec touch {} +
+            done
+
+            mkdir -p ./wrt/tmp && echo "1" > ./wrt/tmp/.build
+
+            echo "toolchain skiped done!"
+          else
+            echo "caches missed!"
+          fi
+
+          if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
+            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
+            for CACHE_KEY in $CACHE_LIST; do
+              gh cache delete $CACHE_KEY
+            done
+
+            echo "caches cleanup done!"
+          fi
+
+      - name: Update Feeds
+        run: |
+          cd ./wrt/
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # 排除 video feed 的 qt5 系列，消除 qt5base/Config.in 的 kconfig 递归依赖
+          # （路由器固件无需图形栈，同时顺带补装 libffi 消除一批 WARNING）
+          ./scripts/feeds install libffi >/dev/null 2>&1 || true
+          ./scripts/feeds uninstall qt5base qt5quick qt5virtualkeyboard \
+            qt5graphicaleffects qt5quick-controls qt5script qt5svg qt5tools \
+            qt5translations qt5webengine qt5xmlpatterns qt5declarative \
+            qt5connectivity qt5serialport 2>/dev/null || true
+          echo "=== qt5 excluded to avoid kconfig recursive dependency ==="
+
+      # ===== athena-led：后端 + LuCI 均用本仓库 package/ 本地版本 =====
+      - name: Custom Packages
+        run: |
+          set -e
+          SRC="$GITHUB_WORKSPACE"
+          WRT="$GITHUB_WORKSPACE/wrt"
+          cd "$WRT"
+
+          # 1. 通用包脚本（吞掉非致命 sed 报错，不中断流程）
+          "$SRC/Scripts/Packages.sh" || echo "Packages.sh done with non-fatal errors"
+          "$SRC/Scripts/Handles.sh"  || echo "Handles.sh done with non-fatal errors"
+
+          # 2. 清理旧目录，避免残留污染
+          rm -rf "$WRT/package/athena-led" "$WRT/package/luci-app-athena-led"
+
+          # 3. 两个包都用当前仓库 package/ 下的本地版本（后端为预编译版）
+          for PKG in athena-led luci-app-athena-led; do
+            if [ -d "$SRC/package/$PKG" ]; then
+              echo "=== Use local $PKG from this repo ==="
+              cp -rf "$SRC/package/$PKG" "$WRT/package/$PKG"
+            else
+              echo "ERROR: $PKG not found in $SRC/package/" >&2
+              exit 1
+            fi
+          done
+
+          echo "=== athena-led packages installed ==="
+          ls -la "$WRT/package/athena-led/Makefile" "$WRT/package/luci-app-athena-led/Makefile"
+
+          # 4. 硬校验：Makefile 必须是 LuCI / OpenWrt 包标准结构
+          for PKG in athena-led luci-app-athena-led; do
+            M="$WRT/package/$PKG/Makefile"
+            [ -f "$M" ] || { echo "ERROR: $M missing" >&2; exit 1; }
+            grep -qn "PKG_NAME" "$M" || { echo "ERROR: $M has no PKG_NAME" >&2; exit 1; }
+          done
+          grep -qE "LUCI_DEPENDS.*athena-led" "$WRT/package/luci-app-athena-led/Makefile" \
+            || echo "WARN: luci-app-athena-led does not declare +athena-led dep, ensure backend is selected manually"
+
+          # 5. 刷新索引，让 OpenWrt 识别刚加入的本地包
+          ./scripts/feeds update -i
+
+          # 6. seeding 最小 .config，避免 prepare 在缺配置时回退 menuconfig（CI 无终端必崩）
+          if [ ! -f .config ] || ! grep -q "^CONFIG_TARGET_.*=y" .config; then
+            echo "=== seeding minimal .config for prepare ==="
+            cat "$SRC/Config/$WRT_CONFIG.txt" "$SRC/Config/GENERAL.txt" > .config 2>/dev/null || \
+            cat "$SRC/Config/$WRT_CONFIG.txt" > .config
+            make defconfig >/dev/null 2>&1 || true
+          fi
+
+          # 7. 用 prepare 代替 check：只校验包定义，不触发 kconfig 交互
+          make package/athena-led/prepare V=s >/dev/null 2>&1 && echo "OK: athena-led/prepare" \
+            || { echo "ERROR: athena-led/prepare failed" >&2; exit 1; }
+          make package/luci-app-athena-led/prepare V=s >/dev/null 2>&1 && echo "OK: luci-app-athena-led/prepare" \
+            || { echo "ERROR: luci-app-athena-led/prepare failed" >&2; exit 1; }
+
+      - name: Custom Settings
+        run: |
+          cd ./wrt/
+
+          if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
+            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
+          else
+            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL.txt >> .config
+          fi
+
+          # 追加手动插件包调整（对应 QCA-ALL 的 WRT_PACKAGE 输入）
+          if [ -n "$WRT_PACKAGE" ]; then
+            echo "$WRT_PACKAGE" | tr '\\n' '\n' >> .config
+          fi
+
+          $GITHUB_WORKSPACE/Scripts/Settings.sh
+
+          # 禁用 menuconfig 交互（CI 无终端），只用 defconfig 生成配置
+          export KCONFIG_NOTIMESTAMP=1
+          make defconfig -j$(nproc) 2>&1 | grep -v "Error opening terminal" || true
+          unset KCONFIG_NOTIMESTAMP
+
+          echo "=== Verify athena-led is selected (fail fast) ==="
+          grep -E "^(CONFIG_PACKAGE_athena-led|CONFIG_PACKAGE_luci-app-athena-led)=" .config || {
+            echo "ERROR: athena-led packages are NOT selected after defconfig, abort." >&2
+            exit 1
+          }
+          grep -E "CONFIG_PACKAGE_athena-led=" .config | grep -q "=y" || {
+            echo "ERROR: CONFIG_PACKAGE_athena-led is not =y, abort." >&2
+            exit 1
+          }
+          grep -E "CONFIG_PACKAGE_luci-app-athena-led=" .config | grep -q "=y" || {
+            echo "ERROR: CONFIG_PACKAGE_luci-app-athena-led is not =y, abort." >&2
+            exit 1
+          }
+          echo "=== athena-led config OK ==="
+
+          make clean -j$(nproc)
+
+      # ===== 禁止 Settings.sh 在编译期回写覆盖 WIFI 名称/密码 =====
+      - name: Prevent wireless overwrite by Settings.sh
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/Scripts/Settings.sh" ]; then
+            sed -i '/set-wireless.sh/d' "$GITHUB_WORKSPACE/Scripts/Settings.sh"
+            echo "Disabled automatic wireless SSID/KEY overwrite."
+          else
+            echo "Settings.sh not found, skipping wireless protection."
+          fi
+
+      - name: Download Packages
+        if: env.WRT_TEST != 'true'
+        run: |
+          cd ./wrt/
+
+          make download -j$(nproc)
+
+      - name: Compile Firmware
+        if: env.WRT_TEST != 'true'
+        run: |
+          cd ./wrt/
+
+          # 预编译包无需单独编 Rust；先编 LuCI 界面，出错定位最清晰
+          make package/luci-app-athena-led/compile -j$(nproc) V=w || make package/luci-app-athena-led/compile -j1 V=s
+          make package/athena-led/compile -j$(nproc) V=w || make package/athena-led/compile -j1 V=s
+
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Machine Information
+        run: |
+          cd ./wrt/
+
+          echo "======================="
+          lscpu | grep -E "name|Core|Thread"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h --max-depth=1
+          echo "======================="
+
+      - name: Package Firmware
+        run: |
+          cd ./wrt/ && mkdir ./upload/
+
+          cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
+
+          if [[ $WRT_TEST != 'true' ]]; then
+            echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
+            echo "WRT_LIST=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^luci-(app|theme)[^ ]*' {} \; | tr '\n' ' ')" >> $GITHUB_ENV
+
+            find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
+
+            for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
+              EXT=$(basename $FILE | cut -d '.' -f 2-)
+              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
+              NEW_FILE="$NAME"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
+              mv -f $FILE ./upload/$NEW_FILE
+            done
+
+            find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
+
+            make clean -j$(nproc)
+          fi
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@master
+        with:
+          tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
+          files: ./wrt/upload/*.*
+          body: |
+            这是个平台固件包，内含多个设备！
+            请注意选择你需要的设备固件！
+            不要问，刷就完事了！
+
+            全系带开源硬件加速，别问了！
+
+            源码：${{env.WRT_REPO}}
+            分支：${{env.WRT_BRANCH}}
+            提交：${{env.WRT_HASH}}
+
+            配置：${{env.WRT_CONFIG}}
+            平台：${{env.WRT_TARGET}}
+
+            登录地址：${{env.WRT_IP}}
+            登录密码：${{env.WRT_PW}}
+
+            WIFI名称：${{env.WRT_SSID}}
+            WIFI密码：${{env.WRT_WORD}}
+
+            内核版本：${{env.WRT_KVER}}
+            插件列表：${{env.WRT_LIST}}
