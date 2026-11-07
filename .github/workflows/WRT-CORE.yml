@@ -172,51 +172,66 @@ jobs:
         run: |
           cd ./wrt/
 
+          # 仅刷新 feeds 仓库索引（-a）。本地包位于 package/ 根目录，
+          # 不在 feeds 管理范围内，放到后面的 Custom Packages 处理，避免被覆盖。
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
-      # ===== athena-led：后端用本仓库，LuCI 用专用插件仓库 =====
+      # ===== athena-led：后端 + LuCI 均使用当前仓库 package/ 下的本地版本 =====
       - name: Custom Packages
         run: |
-          cd ./wrt/package/
+          set -e
+          SRC="$GITHUB_WORKSPACE"
+          WRT="$GITHUB_WORKSPACE/wrt"
 
-          # 1. 通用包脚本（Packages.sh 中 athena-led 已注释，避免重复）
-          "$GITHUB_WORKSPACE/Scripts/Packages.sh"
-          "$GITHUB_WORKSPACE/Scripts/Handles.sh"
+          # 关键：所有 feeds / make 操作必须在源码树根目录执行。
+          # 之前 cd 到 ./wrt/package/ 后再调用 ./scripts/feeds，导致 "No such file or directory"。
+          cd "$WRT"
 
-          # 2. 清理旧目录，避免残留污染（不再需要 led-controller-tmp）
-          rm -rf athena-led luci-app-athena-led
+          # 1. 通用包脚本（Packages.sh 里 sed 操作 package/emortal/ 不存在时属非致命，
+          #    用 || true 吞掉，避免中断；Handles.sh 同理）
+          "$SRC/Scripts/Packages.sh" || echo "Packages.sh: non-fatal errors ignored"
+          "$SRC/Scripts/Handles.sh"  || echo "Handles.sh: non-fatal errors ignored"
+
+          # 2. 清理旧目录，避免残留污染（不再需要 led-controller-tmp，也不再克隆外部仓库）
+          rm -rf "$WRT/package/athena-led" "$WRT/package/luci-app-athena-led"
 
           # 3. 后端 + LuCI 均使用当前仓库 package/ 下的本地版本，不依赖外部仓库
           for PKG in athena-led luci-app-athena-led; do
-            if [ -d "$GITHUB_WORKSPACE/package/$PKG" ]; then
+            if [ -d "$SRC/package/$PKG" ]; then
               echo "=== Use local $PKG from this repo ==="
-              cp -rf "$GITHUB_WORKSPACE/package/$PKG" ./$PKG
+              cp -rf "$SRC/package/$PKG" "$WRT/package/$PKG"
             else
-              echo "ERROR: $PKG not found in $GITHUB_WORKSPACE/package/" >&2
+              echo "ERROR: $SRC/package/$PKG not found" >&2
               exit 1
             fi
           done
 
           echo "=== athena-led packages installed ==="
-          ls -la athena-led/Makefile luci-app-athena-led/Makefile
+          ls -la "$WRT/package/athena-led/Makefile" "$WRT/package/luci-app-athena-led/Makefile"
 
-          # 5. 硬校验：Makefile 必须是 LuCI 标准结构，且依赖声明齐全
-          cd ../../
+          # 4. 硬校验：Makefile 必须是 LuCI 标准结构，且依赖声明齐全
           for PKG in athena-led luci-app-athena-led; do
-            M=./package/$PKG/Makefile
+            M="$WRT/package/$PKG/Makefile"
             [ -f "$M" ] || { echo "ERROR: $M missing" >&2; exit 1; }
             grep -qn "PKG_NAME" "$M" || { echo "ERROR: $M has no PKG_NAME" >&2; exit 1; }
           done
-          grep -qE "LUCI_DEPENDS.*athena-led" ./package/luci-app-athena-led/Makefile \
-            || echo "WARN: luci-app-athena-led does not declare +athena-led dep, ensure backend is selected manually"
-          echo "=== package/feeds scan ==="
+          if grep -qE "LUCI_DEPENDS.*athena-led" "$WRT/package/luci-app-athena-led/Makefile"; then
+            echo "OK: luci-app-athena-led depends on athena-led"
+          else
+            echo "WARN: luci-app-athena-led does not declare +athena-led dep" >&2
+            echo "WARN: ensure CONFIG_PACKAGE_athena-led=y is set explicitly in config" >&2
+          fi
+
+          # 5. 让 OpenWrt 重新索引本地包（Update Feeds 在拷贝之前跑过，这里补一次；
+          #    当前目录为 $WRT，./scripts/feeds 真实存在）
+          echo "=== refresh package index ==="
+          ./scripts/feeds update -i
+          ./scripts/feeds install -a
           ./scripts/feeds list | grep -iE "athena" || echo "note: local packages live in package/, not in feeds"
 
-          # 6. 让 OpenWrt 重新索引本地包（Update Feeds 在拷贝之前跑过，这里补一次）
-          ./scripts/feeds update -i
-          make package/athena-led/check V=s || { echo "ERROR: athena-led/check failed" >&2; exit 1; }
-          make package/luci-app-athena-led/check V=s || { echo "ERROR: luci-app-athena-led/check failed" >&2; exit 1; }
+          # 6. 单独校验包定义能否被 OpenWrt 识别
+          make package/athena-led/check V=s
+          make package/luci-app-athena-led/check V=s
 
       # ===== 预装 Rust 宿主工具链（athena-led 是 Rust 工程，必须先有 cargo/rustc）=====
       # ImmortalWrt 在 BUILD_DIR/host 内自举 lang/rust，再用它交叉编译目标包；
