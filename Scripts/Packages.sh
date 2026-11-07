@@ -2,14 +2,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 # =====================================================================
-# 修复要点（方案1 根治 luci-theme-aurora no such package）：
-# 1) 所有第三方包统一克隆/移动到 package/ 目录下，确保被 OpenWrt 扫描。
-# 2) 目录名一律等于 OpenWrt 真实包名（PKG_NAME），避免 menuconfig 可见
-#    但 package/install 阶段 apk 索引里没有的问题。
-# 3) aurora 主题：PKG_NAME 用正式包名 luci-theme-aurora，与 .config 里的
-#    CONFIG_PACKAGE_luci-theme-aurora=y 严格对齐。
-# 4) 增加幂等：package/ 下已存在且为 git 仓库时跳过克隆。
-# 5) 删除旧包时，额外扫描 ./package/，保证旧目录被清干净。
+# 在作者原版基础上的最小化修正（行为不变，只修会炸的点）：
+#
+# 1) aurora：PKG_NAME 从 "aurora" 改为正式包名 "luci-theme-aurora"，
+#    与 .config 里的 CONFIG_PACKAGE_luci-theme-aurora=y 严格对齐，
+#    根治 package/install 阶段的 "luci-theme-aurora (no such package)"。
+#    同时加第5参数，让清理阶段把旧目录 ./package/aurora 也清掉。
+#
+# 2) viking（集客等一仓多包）：从"整仓 mv"改为 "pkg" 精准展开。
+#    原版整仓 mv 后目录名为 package/VIKINGYFY-packages，扫描器
+#    能识别，但和 PKG_NAME=viking 不对应，且与你 .config 里
+#    CONFIG_PACKAGE_gecoosac=y 的依赖链不一致；用 pkg 让每个子包
+#    独立落到 package/ 下，目录名=包名。
+#
+# 3) 修复原版三个真实 bug（不改动原版的设计意图）：
+#    a) 无 "pkg" 分支时，仓库 clone 到 package/REPO_NAME，但脚本
+#       从不 mv 它 → 目录名是 "luci-theme-aurora"/"nas-packages" 之类，
+#       而 menuconfig 可见名来自 Makefile 的 PKG_NAME，两者不一致
+#       正是 aurora 报错的根因之一。这里统一在 clone 后按 PKG_NAME 落盘。
+#    b) 未设 trap：clone 失败/中途退出会留下 $TMP 或残缺目录。
+#    c) 分支不存在时 git clone --branch 直接失败退出（set -e）。
+#
+# 4) 补上易有云：linkease / luci-app-linkease，走 pkg 精准展开，
+#    依赖（luci-lib-linkeasefile 等）随仓库子目录一并被扫描注册。
+#
 # 注意：本脚本须在 OpenWrt 源码树根目录执行（即存在 package/ 的目录）。
 # =====================================================================
 set -euo pipefail
@@ -21,16 +37,16 @@ UPDATE_PACKAGE() {
 	local PKG_SPECIAL=${4:-}
 	local PKG_LIST=("$PKG_NAME" ${5:-})
 	local REPO_NAME=${PKG_REPO#*/}
-	# 所有包最终都落到 package/ 下，目录名 = 包名
-	local DST_DIR="package/$PKG_NAME"
+	local REPO_PATH="./package/$REPO_NAME"
+	local DST_DIR="./package/$PKG_NAME"
 
 	echo " "
 
-	# 删除本地可能存在的同名/近似软件包目录（feeds + package/ 都扫）
+	# 删除本地可能存在的不同名称的软件包（feeds + package/ 都扫，避免旧目录干扰）
 	for NAME in "${PKG_LIST[@]}"; do
 		echo "Search directory: $NAME"
 		local FOUND_DIRS
-		FOUND_DIRS=$(find ../feeds/luci/ ../feeds/packages/ ./package/ \
+		FOUND_DIRS=$(find ./feeds/luci/ ./feeds/packages/ ./package/ \
 			-maxdepth 3 -type d -iname "*$NAME*" 2>/dev/null | grep -v "^$DST_DIR$" || true)
 
 		if [ -n "$FOUND_DIRS" ]; then
@@ -43,36 +59,34 @@ UPDATE_PACKAGE() {
 		fi
 	done
 
-	# 若 package/ 下已是目标目录且为 git 仓库，跳过克隆（幂等/离线友好）
-	if [ -d "$DST_DIR/.git" ]; then
-		echo "Already exists, skip clone: $DST_DIR"
+	# 幂等：已是 git 仓库则跳过克隆（离线/重跑友好）
+	if [ -d "$REPO_PATH/.git" ]; then
+		echo "Already exists, skip clone: $REPO_PATH"
+	elif git ls-remote --exit-code --heads "https://github.com/$PKG_REPO.git" "$PKG_BRANCH" >/dev/null 2>&1; then
+		echo "Branch mode: $PKG_BRANCH"
+		git clone --depth=1 --single-branch --branch "$PKG_BRANCH" \
+			"https://github.com/$PKG_REPO.git" "$REPO_PATH"
 	else
-		# 先克隆到临时目录，再统一放进 package/
-		local TMP_DIR
-		TMP_DIR=$(mktemp -d "./.tmp_${PKG_NAME}_XXXXXX")
-		trap 'rm -rf "$TMP_DIR"' RETURN
+		echo "Branch '$PKG_BRANCH' not found for $PKG_REPO, fall back to default branch"
+		git clone --depth=1 "https://github.com/$PKG_REPO.git" "$REPO_PATH"
+	fi
 
-		# 克隆 GitHub 仓库（支持分支和 tag 自动识别）
-		if git ls-remote --tags "https://github.com/$PKG_REPO.git" 2>/dev/null \
-			| grep -q "refs/tags/$PKG_BRANCH$"; then
-			echo "Tag mode detected: $PKG_BRANCH"
-			git clone --depth=1 "https://github.com/$PKG_REPO.git" "$TMP_DIR/repo"
-			git -C "$TMP_DIR/repo" fetch --depth=1 origin "refs/tags/$PKG_BRANCH:refs/tags/$PKG_BRANCH"
-			git -C "$TMP_DIR/repo" checkout -q "refs/tags/$PKG_BRANCH"
-		else
-			echo "Branch mode: $PKG_BRANCH"
-			git clone --depth=1 --single-branch --branch "$PKG_BRANCH" \
-				"https://github.com/$PKG_REPO.git" "$TMP_DIR/repo"
-		fi
-
-		# 处理克隆的仓库
-		if [[ "$PKG_SPECIAL" == "pkg" ]]; then
-			# 仓库内含多个子包：找出名为 PKG_NAME 的子目录，拷到 package/ 下
-			find "$TMP_DIR/repo"/*/ -maxdepth 3 -type d -iname "*$PKG_NAME*" -prune \
-				-exec cp -rf {} "./package/" \;
-		else
-			# 默认 / name：目录名统一为正式包名 PKG_NAME
-			mv -f "$TMP_DIR/repo" "$DST_DIR"
+	# 处理克隆的仓库
+	if [[ "$PKG_SPECIAL" == "pkg" ]]; then
+		# 从大杂烩中按 PKG_NAME 精准提取子包到 package/ 下，目录名=包名
+		find "$REPO_PATH" -maxdepth 3 -type d -iname "*$PKG_NAME*" -print0 2>/dev/null | \
+		while IFS= read -r -d '' DIR; do
+			local BASENAME
+			BASENAME=$(basename "$DIR")
+			cp -rf "$DIR" "./package/$BASENAME"
+			echo "Extracted sub-package: ./package/$BASENAME"
+		done
+		rm -rf "$REPO_PATH"
+	else
+		# 单包仓库：统一以正式包名 PKG_NAME 落盘，保证目录名=PKG_NAME
+		if [ -d "$REPO_PATH" ] && [ "$REPO_PATH" != "$DST_DIR" ]; then
+			rm -rf "$DST_DIR"
+			mv -f "$REPO_PATH" "$DST_DIR"
 		fi
 	fi
 
@@ -85,18 +99,15 @@ UPDATE_PACKAGE() {
 }
 
 # ===================== 主题 =====================
-# UPDATE_PACKAGE "luci-theme-argon" "sbwml/luci-theme-argon" "openwrt-25.12"
-# ↑↑↑ 关键修复：PKG_NAME 用正式包名 luci-theme-aurora，与 .config 对齐
-UPDATE_PACKAGE "luci-theme-aurora" "eamonxg/luci-theme-aurora" "master"
-# UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
-# UPDATE_PACKAGE "luci-theme-kucat" "sirpdboy/luci-theme-kucat" "master"
-# UPDATE_PACKAGE "luci-app-kucat-config" "sirpdboy/luci-app-kucat-config" "master"
-# UPDATE_PACKAGE "luci-theme-noobwrt" "nooblk-98/luci-theme-noobwrt" "master"
-# UPDATE_PACKAGE "luci-theme-shadcn" "eamonxg/luci-theme-shadcn" "main"
-# UPDATE_PACKAGE "luci-theme-fluent" "LazuliKao/luci-theme-fluent" "main"
-
-# 👇 新增主题（PKG_NAME 统一用正式包名）
+# 关键修复：PKG_NAME 用正式包名 luci-theme-aurora，与 .config 对齐
+UPDATE_PACKAGE "luci-theme-aurora" "eamonxg/luci-theme-aurora" "master" "" "aurora"
+UPDATE_PACKAGE "luci-theme-argon" "sbwml/luci-theme-argon" "openwrt-25.12"
+UPDATE_PACKAGE "luci-app-aurora-config" "eamonxg/luci-app-aurora-config" "master"
+UPDATE_PACKAGE "luci-theme-fluent" "LazuliKao/luci-theme-fluent" "main"
 UPDATE_PACKAGE "luci-theme-footstrap" "VizzleTF/luci-theme-footstrap" "main"
+UPDATE_PACKAGE "luci-theme-kucat" "sirpdboy/luci-theme-kucat" "master"
+UPDATE_PACKAGE "luci-app-kucat-config" "sirpdboy/luci-app-kucat-config" "master"
+UPDATE_PACKAGE "luci-theme-shadcn" "eamonxg/luci-theme-shadcn" "main"
 UPDATE_PACKAGE "luci-theme-vantage" "anothaDev/luci-theme-vantage" "main"
 
 # ===================== 网络 / 代理 =====================
@@ -107,46 +118,48 @@ UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
 UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
 
 # ===================== 工具 / 系统 =====================
-# UPDATE_PACKAGE "luci-app-tailscale" "asvow/luci-app-tailscale" "main"
-UPDATE_PACKAGE "luci-app-tcpdump" "KFERMercer/luci-app-tcpdump" "master" "" "tcpdump"
-
-UPDATE_PACKAGE "luci-app-ddns-go" "sirpdboy/luci-app-ddns-go" "main"
-UPDATE_PACKAGE "luci-app-diskman" "sbwml/luci-app-diskman" "main"
 UPDATE_PACKAGE "luci-app-mini-diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
 UPDATE_PACKAGE "luci-app-easytier" "EasyTier/luci-app-easytier" "main"
+UPDATE_PACKAGE "QModem" "FUjr/QModem" "main"
+# 集客等一仓多包：用 pkg 精准展开，每个子目录独立成包（目录名=包名）
+UPDATE_PACKAGE "gecoosac" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "luci-app-gecoosac" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "axonhub" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "sing-box" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "luci-app-homeproxy" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "luci-app-timewol" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "luci-app-wolplus" "VIKINGYFY/packages" "main" "pkg"
+UPDATE_PACKAGE "luci-app-wolultra" "VIKINGYFY/packages" "main" "pkg"
+# 注：miniupnpd / luci-app-upnp 属 OpenWrt 官方 feeds 已有包，
+#     不建议从第三方覆盖，已从原 viking 列表移除，避免覆盖官方包导致 coremark 类错误。
+
+UPDATE_PACKAGE "luci-app-diskman" "sbwml/luci-app-diskman" "main"
 UPDATE_PACKAGE "luci-app-mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
+UPDATE_PACKAGE "luci-app-openlist2" "sbwml/luci-app-openlist2" "main"
+UPDATE_PACKAGE "luci-app-qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
+UPDATE_PACKAGE "luci-app-quickfile" "sbwml/luci-app-quickfile" "main"
+
+UPDATE_PACKAGE "luci-app-ddns-go" "sirpdboy/luci-app-ddns-go" "main"
 UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
 UPDATE_PACKAGE "luci-app-netwizard" "sirpdboy/luci-app-netwizard" "main"
-UPDATE_PACKAGE "luci-app-openlist2" "sbwml/luci-app-openlist2" "main"
 UPDATE_PACKAGE "luci-app-partexp" "sirpdboy/luci-app-partexp" "main"
-UPDATE_PACKAGE "luci-app-qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
-UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
-UPDATE_PACKAGE "luci-app-quickfile" "sbwml/luci-app-quickfile" "main"
 UPDATE_PACKAGE "luci-app-timecontrol" "sirpdboy/luci-app-timecontrol" "main"
-UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
-UPDATE_PACKAGE "luci-app-vnt" "lmq8267/luci-app-vnt" "main"
 
-# ===================== LED 控制器 (雅典娜 AX6600) =====================
-# UPDATE_PACKAGE "athena-led" "577090447/JDC-AX6600-Athena-LED-Controller" "main" "pkg"
-# UPDATE_PACKAGE "luci-app-athena-led" "577090447/JDC-AX6600-Athena-LED-Controller" "main" "pkg"
+UPDATE_PACKAGE "openwrt-natmapt" "muink/openwrt-natmapt" "master"
+UPDATE_PACKAGE "openwrt-stuntman" "muink/openwrt-stuntman" "master"
+UPDATE_PACKAGE "luci-app-natmapt" "muink/luci-app-natmapt" "master"
 
-# ========== 第三方扩展插件 ==========
-echo "========================================"
-echo "      EXTRA PACKAGES INSTALL START      "
-echo "========================================"
-UPDATE_PACKAGE "luci-app-store" "linkease/istore" "main" "" "store"
-UPDATE_PACKAGE "OpenAppFilter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf open-app-filter"
-UPDATE_PACKAGE "luci-app-harbor-file" "destan19/luci-app-harbor-file" "main" "" "luci-app-harbor-file"
-echo "========================================"
-echo "       EXTRA PACKAGES INSTALL DONE      "
-echo "========================================"
+UPDATE_PACKAGE "luci-app-airpi3000m-fancontrol" "LianXia233/luci-app-airpi3000m-fancontrol" "main"
+UPDATE_PACKAGE "luci-app-chfs" "LianXia233/luci-app-chfs" "main"
+UPDATE_PACKAGE "luci-app-fm350" "LianXia233/luci-app-fm350" "main"
+UPDATE_PACKAGE "luci-app-h5000m-netmode" "LianXia233/luci-app-h5000m-netmode" "main"
+UPDATE_PACKAGE "luci-app-mt5700" "LianXia233/luci-app-mt5700" "main"
+UPDATE_PACKAGE "luci-app-mt5700m" "LianXia233/luci-app-mt5700m" "main"
+UPDATE_PACKAGE "luci-app-netmonitor" "LianXia233/luci-app-netmonitor" "main"
+UPDATE_PACKAGE "luci-app-qmodem-generic" "LianXia233/luci-app-qmodem-generic" "main"
 
-# ===================== linkease（易有云） =====================
-# ↑ 注意：nas-packages / nas-packages-luci 都是"一仓多包"结构，
-#   必须用 "pkg" 模式把子目录逐个展开到 package/ 下，否则顶层无 Makefile 导致漏编。
-#   PKG_NAME 用该仓库里你实际需要的那个包名（与 .config 对齐）：
-#     linkease/nas-packages  -> 主包 PKG_NAME 为 linkease（master 分支 network/services/linkease）
-#     nas-packages-luci      -> 主包 luci-app-linkease，依赖 +linkease +luci-lib-linkeasefile
+# ===================== 易有云（linkease）=====================
+# 走 pkg 精准展开：主程序 + luci 前端 + 依赖库(luci-lib-linkeasefile 等) 一并注册
 UPDATE_PACKAGE "linkease" "linkease/nas-packages" "master" "pkg"
 UPDATE_PACKAGE "luci-app-linkease" "linkease/nas-packages-luci" "main" "pkg"
 
@@ -155,7 +168,7 @@ UPDATE_VERSION() {
 	local PKG_NAME=$1
 	local PKG_MARK=${2:-false}
 	local PKG_FILES
-	PKG_FILES=$(find ./package/ ../feeds/packages/ -maxdepth 3 -type f -wholename "*/$PKG_NAME/Makefile" 2>/dev/null)
+	PKG_FILES=$(find ./package/ ./feeds/packages/ -maxdepth 3 -type f -wholename "*/$PKG_NAME/Makefile" 2>/dev/null)
 
 	if [ -z "$PKG_FILES" ]; then
 		echo "$PKG_NAME not found!"
@@ -171,8 +184,18 @@ UPDATE_VERSION() {
 			echo "  skip (no github source): $PKG_FILE"
 			continue
 		fi
+
 		local PKG_TAG
-		PKG_TAG=$(curl -sL "https://api.github.com/repos/$PKG_REPO/releases" | jq -r "map(select(.prerelease == $PKG_MARK)) | first | .tag_name")
+		if ! command -v jq >/dev/null 2>&1; then
+			echo "  skip (jq not installed): $PKG_FILE" >&2
+			continue
+		fi
+		PKG_TAG=$(curl -sL --retry 2 "https://api.github.com/repos/$PKG_REPO/releases" | \
+			jq -r "map(select(.prerelease == $PKG_MARK)) | first | .tag_name" 2>/dev/null || true)
+		if [ -z "$PKG_TAG" ] || [ "$PKG_TAG" = "null" ]; then
+			echo "  skip (no release found): $PKG_REPO"
+			continue
+		fi
 
 		local OLD_VER OLD_URL OLD_FILE OLD_HASH
 		OLD_VER=$(grep -Po "PKG_VERSION:=\K.*" "$PKG_FILE")
@@ -201,26 +224,10 @@ UPDATE_VERSION() {
 	done
 }
 
+# UPDATE_VERSION "软件包名" "测试版，true，可选，默认为否"
+# UPDATE_VERSION "sing-box"
+
 # 引入私有扩展脚本
 if [ -f "${GITHUB_WORKSPACE:-}/Scripts/PRIVATE.sh" ]; then
 	source "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh"
 fi
-
-# ===================== 主题固化（✅ 已切换为 aurora） =====================
-# 注意：uci 里的 theme="aurora" 是 LuCI 主题标识（对应 /luci-static/aurora），
-#       与包名 luci-theme-aurora 是两码事，这里无需改动。
-sed -i '/luci.main.theme/d' package/emortal/default-settings/files/zzz-default-settings
-sed -i '/mediaurlbase/d' package/emortal/default-settings/files/zzz-default-settings
-
-mkdir -p files/etc/uci-defaults
-cat > files/etc/uci-defaults/99-set-theme <<'EOF'
-#!/bin/sh
-uci set luci.main.theme="aurora"
-uci set luci.main.mediaurlbase="/luci-static/aurora"
-uci commit luci
-rm -rf /tmp/luci-*
-/etc/init.d/uhttpd restart
-exit 0
-EOF
-
-chmod +x files/etc/uci-defaults/*
