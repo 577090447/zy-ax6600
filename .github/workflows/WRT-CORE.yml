@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
-# 云编译公用核心（已修改：注入仓库 files/ 并禁止 Settings.sh 覆盖无线配置，athena-led 使用新仓库精确拷贝）
+# 云编译公用核心
+# athena-led 改动说明（2026-11-07）：
+#   1) athena-led 后端改用当前仓库 package/athena-led（含 Cargo.toml 的 Rust 工程）
+#      luci-app-athena-led 仍从专用插件仓库拉取
+#   2) 编译前先 make package/lang/rust/host/compile，确保 cargo/rustc 与
+#      aarch64-unknown-linux-musl 标准库就位（ImmortalWrt 交叉编译 Rust 的标准做法）
+#   3) 编译前硬性校验两个包必须被选中，未选中直接失败，避免产出“缺插件的假固件”
+#   4) 保留：files/ 注入、禁止 Settings.sh 回写无线、GENERAL.txt 合并逻辑
 name: WRT-CORE
 
 on:
@@ -168,30 +175,75 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ===== ✅ athena-led 精确拷贝（新仓库，本地化预编译，不重复）=====
+      # ===== athena-led：后端用本仓库，LuCI 用专用插件仓库 =====
       - name: Custom Packages
         run: |
           cd ./wrt/package/
 
-          # 1. 先跑通用包脚本（Packages.sh 中 athena-led 已注释，避免重复）
-          $GITHUB_WORKSPACE/Scripts/Packages.sh
-          $GITHUB_WORKSPACE/Scripts/Handles.sh
+          # 1. 通用包脚本（Packages.sh 中 athena-led 已注释，避免重复）
+          "$GITHUB_WORKSPACE/Scripts/Packages.sh"
+          "$GITHUB_WORKSPACE/Scripts/Handles.sh"
 
-          # 2. ✅ athena-led 核心包 + luci-app-athena-led 界面包（精确拷贝子目录）
-          echo "=== Installing athena-led from fork repo ==="
-          rm -rf athena-led luci-app-athena-led led-controller-tmp
+          # 2. 清理旧目录，避免残留污染（不再需要 led-controller-tmp）
+          rm -rf athena-led luci-app-athena-led
 
-          git clone --depth=1 --single-branch --branch main \
-            https://github.com/577090447/JDC-AX6600-Athena-LED-Controller.git led-controller-tmp
-
-          # 只拷贝两个包目录，不污染 package/ 根目录
-          cp -rf led-controller-tmp/athena-led ./athena-led/
-          cp -rf led-controller-tmp/luci-app-athena-led ./luci-app-athena-led/
-
-          rm -rf led-controller-tmp
+          # 3. 后端 + LuCI 均使用当前仓库 package/ 下的本地版本，不依赖外部仓库
+          for PKG in athena-led luci-app-athena-led; do
+            if [ -d "$GITHUB_WORKSPACE/package/$PKG" ]; then
+              echo "=== Use local $PKG from this repo ==="
+              cp -rf "$GITHUB_WORKSPACE/package/$PKG" ./$PKG
+            else
+              echo "ERROR: $PKG not found in $GITHUB_WORKSPACE/package/" >&2
+              exit 1
+            fi
+          done
 
           echo "=== athena-led packages installed ==="
-          ls -la athena-led/Makefile luci-app-athena-led/Makefile 2>/dev/null || echo "Check files above"
+          ls -la athena-led/Makefile luci-app-athena-led/Makefile
+
+          # 5. 硬校验：Makefile 必须是 LuCI 标准结构，且依赖声明齐全
+          cd ../../
+          for PKG in athena-led luci-app-athena-led; do
+            M=./package/$PKG/Makefile
+            [ -f "$M" ] || { echo "ERROR: $M missing" >&2; exit 1; }
+            grep -qn "PKG_NAME" "$M" || { echo "ERROR: $M has no PKG_NAME" >&2; exit 1; }
+          done
+          grep -qE "LUCI_DEPENDS.*athena-led" ./package/luci-app-athena-led/Makefile \
+            || echo "WARN: luci-app-athena-led does not declare +athena-led dep, ensure backend is selected manually"
+          echo "=== package/feeds scan ==="
+          ./scripts/feeds list | grep -iE "athena" || echo "note: local packages live in package/, not in feeds"
+
+          # 6. 让 OpenWrt 重新索引本地包（Update Feeds 在拷贝之前跑过，这里补一次）
+          ./scripts/feeds update -i
+          make package/athena-led/check V=s || { echo "ERROR: athena-led/check failed" >&2; exit 1; }
+          make package/luci-app-athena-led/check V=s || { echo "ERROR: luci-app-athena-led/check failed" >&2; exit 1; }
+
+      # ===== 预装 Rust 宿主工具链（athena-led 是 Rust 工程，必须先有 cargo/rustc）=====
+      # ImmortalWrt 在 BUILD_DIR/host 内自举 lang/rust，再用它交叉编译目标包；
+      # 官方仓库明确该 target 为 aarch64-unknown-linux-musl，与 IPQ60XX 的 aarch64 一致。
+      - name: Prepare Rust toolchain for target
+        if: env.WRT_TEST != 'true'
+        run: |
+          cd ./wrt/
+
+          echo "=== check rust build system ==="
+          if [ -f "package/lang/rust/rust-values.mk" ] && [ -f "package/lang/rust/rust-package.mk" ]; then
+            echo "ImmortalWrt rust build system found, building host toolchain..."
+            make package/lang/rust/host/compile -j$(nproc) V=w || \
+            make package/lang/rust/host/compile -j1 V=s
+          else
+            echo "WARNING: package/lang/rust not found in this source tree." >&2
+            echo "If athena-led Makefile uses cargo directly, the build will fail." >&2
+          fi
+
+          echo "=== verify cargo available ==="
+          CARGO_BIN=$(find ./staging_dir/host/bin -name cargo -type f 2>/dev/null | head -1)
+          if [ -n "$CARGO_BIN" ]; then
+            "$CARGO_BIN" --version
+            "$CARGO_BIN" target list --list | grep -iE "aarch64-unknown-linux-musl" || true
+          else
+            echo "WARNING: cargo not found in staging_dir/host/bin after rust build." >&2
+          fi
 
       - name: Custom Settings
         run: |
@@ -205,7 +257,24 @@ jobs:
 
           $GITHUB_WORKSPACE/Scripts/Settings.sh
 
-          make defconfig -j$(nproc) && make clean -j$(nproc)
+          make defconfig -j$(nproc)
+
+          echo "=== Verify athena-led is selected (fail fast) ==="
+          grep -E "^(CONFIG_PACKAGE_athena-led|CONFIG_PACKAGE_luci-app-athena-led)=" .config || {
+            echo "ERROR: athena-led packages are NOT selected after defconfig, abort." >&2
+            exit 1
+          }
+          grep -E "CONFIG_PACKAGE_athena-led=" .config | grep -q "=y" || {
+            echo "ERROR: CONFIG_PACKAGE_athena-led is not =y, abort." >&2
+            exit 1
+          }
+          grep -E "CONFIG_PACKAGE_luci-app-athena-led=" .config | grep -q "=y" || {
+            echo "ERROR: CONFIG_PACKAGE_luci-app-athena-led is not =y, abort." >&2
+            exit 1
+          }
+          echo "=== athena-led config OK ==="
+
+          make clean -j$(nproc)
 
       # ===== 禁止 Settings.sh 在编译期回写覆盖 WIFI 名称/密码 =====
       - name: Prevent wireless overwrite by Settings.sh
@@ -228,6 +297,10 @@ jobs:
         if: env.WRT_TEST != 'true'
         run: |
           cd ./wrt/
+
+          # 先单独编译 athena-led，Rust 报错定位最清晰；失败则整体编译不再浪费时间
+          make package/athena-led/compile -j$(nproc) V=w || make package/athena-led/compile -j1 V=s
+          make package/luci-app-athena-led/compile -j$(nproc) V=w || make package/luci-app-athena-led/compile -j1 V=s
 
           make -j$(nproc) || make -j1 V=s
 
