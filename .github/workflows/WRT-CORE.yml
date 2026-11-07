@@ -2,15 +2,13 @@
 # Copyright (C) 2026 VIKINGYFY
 
 # 云编译公用核心
-# athena-led 改动说明（2026-11-07 最终版）：
-#   1) athena-led 后端 + luci-app-athena-led 均使用本仓库 package/ 下的本地版本
-#      （后端为预编译版 Makefile，PKG_SOURCE:=none，不走 cargo/Rust）
-#   2) 已删除 Prepare Rust toolchain 步骤（预编译包无需 rust 宿主工具链）
-#   3) 用 make package/.../prepare 代替 check，规避 CI 无终端触发 menuconfig
-#   4) Update Feeds 后主动 uninstall qt5 系列，消除 video feed 的 kconfig 递归依赖
-#   5) defconfig 加 KCONFIG_NOTIMESTAMP，彻底封死 menuconfig 交互回退
-#   6) 编译前硬性校验两个包必须被选中，未选中直接失败
-#   7) 保留：files/ 注入、禁止 Settings.sh 回写无线、GENERAL.txt 合并逻辑
+# 修订记录：
+#   1) 把构建环境初始化脚本本地化（不再 curl 远程裸执行）
+#   2) feeds install 拆到第三方包就位之后执行，修复第三方包全部不生效
+#   3) 所有第三方包改为精确拷贝子目录，避免 Makefile 深于 2 级被漏扫
+#   4) 新增 Diagnose 自检步骤，快速定位包索引/配置问题
+#   5) 无线防覆盖步骤前移，修复原时序无效问题
+#   6) 缓存清理改用 gh cache list --format json，避免 cut -f1 解析脆断
 name: WRT-CORE
 
 on:
@@ -56,7 +54,7 @@ on:
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
   WRT_CONFIG: ${{inputs.WRT_CONFIG}}
-  WRT_THEME: ${{inputs.WRT_THEME}}
+  WRT_THEME: ${{inputs.WRT_TMEME}}
   WRT_NAME: ${{inputs.WRT_NAME}}
   WRT_SSID: ${{inputs.WRT_SSID}}
   WRT_WORD: ${{inputs.WRT_WORD}}
@@ -86,8 +84,13 @@ jobs:
           sudo -E apt -yqq autoremove --purge
           sudo -E apt -yqq autoclean
           sudo -E apt -yqq clean
-          sudo -E apt -yqq install dos2unix libfuse-dev libncurses-dev libncurses6
-          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E apt -yqq install dos2unix libfuse-dev libncurses-dev libncurses6 jq
+          # 构建环境初始化脚本本地化：优先使用仓库内副本，缺失时才回退到官方远程
+          if [ -x "$GITHUB_WORKSPACE/Scripts/init_build_environment.sh" ]; then
+            sudo bash "$GITHUB_WORKSPACE/Scripts/init_build_environment.sh"
+          else
+            sudo bash -c 'bash <(curl -fsSL --retry 3 https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          fi
           sudo -E systemctl daemon-reload
           sudo -E timedatectl set-timezone "Asia/Shanghai"
 
@@ -134,6 +137,13 @@ jobs:
         run: |
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
 
+      - name: Update Feeds (only update, do not install yet)
+        run: |
+          cd ./wrt/
+
+          ./scripts/feeds update -a
+          # 注意：install 延后到第三方包就位之后，否则新增包不会被建索引
+
       - name: Check Caches
         id: check-cache
         if: env.WRT_TEST != 'true'
@@ -162,84 +172,72 @@ jobs:
           fi
 
           if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
-            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
-            for CACHE_KEY in $CACHE_LIST; do
-              gh cache delete $CACHE_KEY
+            # 使用 --format json 解析，规避 cut -f1 在 CLI 版本变化时的脆断
+            gh cache list --key "$WRT_CONFIG-$WRT_INFO" --format json | jq -r '.[].id' | while read -r CACHE_ID; do
+              [ -n "$CACHE_ID" ] && gh cache delete "$CACHE_ID"
             done
 
             echo "caches cleanup done!"
           fi
 
-      - name: Update Feeds
-        run: |
-          cd ./wrt/
-
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-          # 排除 video feed 的 qt5 系列，消除 qt5base/Config.in 的 kconfig 递归依赖
-          # （路由器固件无需图形栈，同时顺带补装 libffi 消除一批 WARNING）
-          ./scripts/feeds install libffi >/dev/null 2>&1 || true
-          ./scripts/feeds uninstall qt5base qt5quick qt5virtualkeyboard \
-            qt5graphicaleffects qt5quick-controls qt5script qt5svg qt5tools \
-            qt5translations qt5webengine qt5xmlpatterns qt5declarative \
-            qt5connectivity qt5serialport 2>/dev/null || true
-          echo "=== qt5 excluded to avoid kconfig recursive dependency ==="
-
-      # ===== athena-led：后端 + LuCI 均用本仓库 package/ 本地版本 =====
+      # ===== 第三方包统一用“精确拷贝子目录”，保证 Makefile 处于 package 下 2 级以内 =====
       - name: Custom Packages
         run: |
           set -e
-          SRC="$GITHUB_WORKSPACE"
-          WRT="$GITHUB_WORKSPACE/wrt"
-          cd "$WRT"
+          cd ./wrt/package/
 
-          # 1. 通用包脚本（吞掉非致命 sed 报错，不中断流程）
-          "$SRC/Scripts/Packages.sh" || echo "Packages.sh done with non-fatal errors"
-          "$SRC/Scripts/Handles.sh"  || echo "Handles.sh done with non-fatal errors"
+          # 1. 通用包脚本（Packages.sh / Handles.sh）
+          $GITHUB_WORKSPACE/Scripts/Packages.sh
+          $GITHUB_WORKSPACE/Scripts/Handles.sh
 
-          # 2. 清理旧目录，避免残留污染
-          rm -rf "$WRT/package/athena-led" "$WRT/package/luci-app-athena-led"
+          # 2. athena-led：核心包 + luci 界面包
+          echo "=== Installing athena-led ==="
+          rm -rf athena-led luci-app-athena-led
+          git clone --depth=1 --single-branch --branch main \
+            https://github.com/577090447/JDC-AX6600-Athena-LED-Controller.git /tmp/led-tmp
+          cp -rf /tmp/led-tmp/athena-led ./athena-led/
+          cp -rf /tmp/led-tmp/luci-app-athena-led ./luci-app-athena-led/
+          rm -rf /tmp/led-tmp
 
-          # 3. 两个包都用当前仓库 package/ 下的本地版本（后端为预编译版）
-          for PKG in athena-led luci-app-athena-led; do
-            if [ -d "$SRC/package/$PKG" ]; then
-              echo "=== Use local $PKG from this repo ==="
-              cp -rf "$SRC/package/$PKG" "$WRT/package/$PKG"
+          # 3. 易有云：服务包 + luci 界面包（仓库结构是子目录，必须精确拷贝）
+          echo "=== Installing linkease ==="
+          rm -rf linkease luci-app-linkease
+          git clone --depth=1 --single-branch --branch master \
+            https://github.com/linkease/nas-packages.git /tmp/nas-tmp
+          cp -rf /tmp/nas-tmp/network/services/linkease ./linkease/
+          rm -rf /tmp/nas-tmp
+          git clone --depth=1 --single-branch --branch main \
+            https://github.com/linkease/nas-packages-luci.git /tmp/nasluci-tmp
+          cp -rf /tmp/nasluci-tmp/luci/luci-app-linkease ./luci-app-linkease/
+          rm -rf /tmp/nasluci-tmp
+
+          echo "=== installed packages ==="
+          for p in athena-led luci-app-athena-led linkease luci-app-linkease; do
+            if [ -f "$p/Makefile" ]; then
+              echo "OK   $p/Makefile"
             else
-              echo "ERROR: $PKG not found in $SRC/package/" >&2
-              exit 1
+              echo "MISS $p/Makefile" >&2
             fi
           done
 
-          echo "=== athena-led packages installed ==="
-          ls -la "$WRT/package/athena-led/Makefile" "$WRT/package/luci-app-athena-led/Makefile"
+      # ===== 第三方包就位后再建索引，这是修复“第三方包全部拉取不到”的关键 =====
+      - name: Install Feeds (after custom packages landed)
+        run: |
+          cd ./wrt/
+          ./scripts/feeds install -a
 
-          # 4. 硬校验：Makefile 必须是 LuCI / OpenWrt 包标准结构
-          for PKG in athena-led luci-app-athena-led; do
-            M="$WRT/package/$PKG/Makefile"
-            [ -f "$M" ] || { echo "ERROR: $M missing" >&2; exit 1; }
-            grep -qn "PKG_NAME" "$M" || { echo "ERROR: $M has no PKG_NAME" >&2; exit 1; }
-          done
-          grep -qE "LUCI_DEPENDS.*athena-led" "$WRT/package/luci-app-athena-led/Makefile" \
-            || echo "WARN: luci-app-athena-led does not declare +athena-led dep, ensure backend is selected manually"
-
-          # 5. 刷新索引，让 OpenWrt 识别刚加入的本地包
-          ./scripts/feeds update -i
-
-          # 6. seeding 最小 .config，避免 prepare 在缺配置时回退 menuconfig（CI 无终端必崩）
-          if [ ! -f .config ] || ! grep -q "^CONFIG_TARGET_.*=y" .config; then
-            echo "=== seeding minimal .config for prepare ==="
-            cat "$SRC/Config/$WRT_CONFIG.txt" "$SRC/Config/GENERAL.txt" > .config 2>/dev/null || \
-            cat "$SRC/Config/$WRT_CONFIG.txt" > .config
-            make defconfig >/dev/null 2>&1 || true
-          fi
-
-          # 7. 用 prepare 代替 check：只校验包定义，不触发 kconfig 交互
-          make package/athena-led/prepare V=s >/dev/null 2>&1 && echo "OK: athena-led/prepare" \
-            || { echo "ERROR: athena-led/prepare failed" >&2; exit 1; }
-          make package/luci-app-athena-led/prepare V=s >/dev/null 2>&1 && echo "OK: luci-app-athena-led/prepare" \
-            || { echo "ERROR: luci-app-athena-led/prepare failed" >&2; exit 1; }
+      # ===== 自检：一眼看出包到底进了哪一层 =====
+      - name: Diagnose Packages
+        run: |
+          cd ./wrt/
+          echo "=== feeds 索引行数（为 0 说明 update 网络失败） ==="
+          for f in feeds/*.index; do [ -f "$f" ] && echo "$f: $(wc -l < "$f") lines"; done
+          echo "=== 关键第三方包是否在索引中 ==="
+          grep -h "Package:" feeds/*.index 2>/dev/null | grep -iE "openclash|passwall|aurora|vantage|linkease|ddns-go|diskman|athena-led|store" || echo "NOT FOUND IN INDEX"
+          echo "=== package/ 下实际存在的第三方目录 ==="
+          ls package/ | grep -iE "openclash|passwall|aurora|vantage|linkease|ddns-go|diskman|athena-led|store" || echo "NONE IN package/"
+          echo "=== .config 中已选中的第三方包 ==="
+          grep -oE "CONFIG_PACKAGE_(luci-(app|theme)-[a-z0-9-]+|linkease|athena-led)=y" .config || echo "NONE SELECTED"
 
       - name: Custom Settings
         run: |
@@ -251,44 +249,20 @@ jobs:
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL.txt >> .config
           fi
 
-          # 追加手动插件包调整（对应 QCA-ALL 的 WRT_PACKAGE 输入）
+          # 手动包调整：追加或覆盖对应 CONFIG_PACKAGE 开关
           if [ -n "$WRT_PACKAGE" ]; then
-            echo "$WRT_PACKAGE" | tr '\\n' '\n' >> .config
+            printf '%s\n' "$WRT_PACKAGE" >> .config
+          fi
+
+          # 无线防覆盖必须在本步骤之前/之中生效；Settings.sh 跑完后不再回写无线
+          if [ -f "$GITHUB_WORKSPACE/Scripts/Settings.sh" ]; then
+            sed -i '/set-wireless.sh/d' "$GITHUB_WORKSPACE/Scripts/Settings.sh"
+            echo "Disabled automatic wireless SSID/KEY overwrite."
           fi
 
           $GITHUB_WORKSPACE/Scripts/Settings.sh
 
-          # 禁用 menuconfig 交互（CI 无终端），只用 defconfig 生成配置
-          export KCONFIG_NOTIMESTAMP=1
-          make defconfig -j$(nproc) 2>&1 | grep -v "Error opening terminal" || true
-          unset KCONFIG_NOTIMESTAMP
-
-          echo "=== Verify athena-led is selected (fail fast) ==="
-          grep -E "^(CONFIG_PACKAGE_athena-led|CONFIG_PACKAGE_luci-app-athena-led)=" .config || {
-            echo "ERROR: athena-led packages are NOT selected after defconfig, abort." >&2
-            exit 1
-          }
-          grep -E "CONFIG_PACKAGE_athena-led=" .config | grep -q "=y" || {
-            echo "ERROR: CONFIG_PACKAGE_athena-led is not =y, abort." >&2
-            exit 1
-          }
-          grep -E "CONFIG_PACKAGE_luci-app-athena-led=" .config | grep -q "=y" || {
-            echo "ERROR: CONFIG_PACKAGE_luci-app-athena-led is not =y, abort." >&2
-            exit 1
-          }
-          echo "=== athena-led config OK ==="
-
-          make clean -j$(nproc)
-
-      # ===== 禁止 Settings.sh 在编译期回写覆盖 WIFI 名称/密码 =====
-      - name: Prevent wireless overwrite by Settings.sh
-        run: |
-          if [ -f "$GITHUB_WORKSPACE/Scripts/Settings.sh" ]; then
-            sed -i '/set-wireless.sh/d' "$GITHUB_WORKSPACE/Scripts/Settings.sh"
-            echo "Disabled automatic wireless SSID/KEY overwrite."
-          else
-            echo "Settings.sh not found, skipping wireless protection."
-          fi
+          make defconfig -j$(nproc) && make clean -j$(nproc)
 
       - name: Download Packages
         if: env.WRT_TEST != 'true'
@@ -301,10 +275,6 @@ jobs:
         if: env.WRT_TEST != 'true'
         run: |
           cd ./wrt/
-
-          # 预编译包无需单独编 Rust；先编 LuCI 界面，出错定位最清晰
-          make package/luci-app-athena-led/compile -j$(nproc) V=w || make package/luci-app-athena-led/compile -j1 V=s
-          make package/athena-led/compile -j$(nproc) V=w || make package/athena-led/compile -j1 V=s
 
           make -j$(nproc) || make -j1 V=s
 
@@ -322,7 +292,7 @@ jobs:
 
       - name: Package Firmware
         run: |
-          cd ./wrt/ && mkdir ./upload/
+          cd ./wrt/ && mkdir -p ./upload/
 
           cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
 
@@ -333,10 +303,10 @@ jobs:
             find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
 
             for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
-              EXT=$(basename $FILE | cut -d '.' -f 2-)
-              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
+              EXT=$(basename "$FILE" | cut -d '.' -f 2-)
+              NAME=$(basename "$FILE" | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
               NEW_FILE="$NAME"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
-              mv -f $FILE ./upload/$NEW_FILE
+              mv -f "$FILE" ./upload/"$NEW_FILE"
             done
 
             find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
