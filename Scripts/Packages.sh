@@ -142,8 +142,13 @@ echo "       EXTRA PACKAGES INSTALL DONE      "
 echo "========================================"
 
 # ===================== linkease（易有云） =====================
-UPDATE_PACKAGE "linkease" "linkease/nas-packages" "master" "" "linkease"
-UPDATE_PACKAGE "luci-app-linkease" "linkease/nas-packages-luci" "main" "" "luci-app-linkease luci-i18n-linkease-zh-cn"
+# ↑ 注意：nas-packages / nas-packages-luci 都是"一仓多包"结构，
+#   必须用 "pkg" 模式把子目录逐个展开到 package/ 下，否则顶层无 Makefile 导致漏编。
+#   PKG_NAME 用该仓库里你实际需要的那个包名（与 .config 对齐）：
+#     linkease/nas-packages  -> 主包 PKG_NAME 为 linkease（master 分支 network/services/linkease）
+#     nas-packages-luci      -> 主包 luci-app-linkease，依赖 +linkease +luci-lib-linkeasefile
+UPDATE_PACKAGE "linkease" "linkease/nas-packages" "master" "pkg"
+UPDATE_PACKAGE "luci-app-linkease" "linkease/nas-packages-luci" "main" "pkg"
 
 # ===================== 版本更新函数 =====================
 UPDATE_VERSION() {
